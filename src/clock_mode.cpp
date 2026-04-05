@@ -5,129 +5,84 @@
 #include "layout.h"
 #include <time.h>
 
-// Font 7 digit dimensions (same as pong clock)
-#define CLK_DIGIT_W   LY_ARK_DIGIT_W   // 32
-#define CLK_DIGIT_H   LY_ARK_DIGIT_H   // 48
-#define CLK_COLON_W   LY_ARK_COLON_W   // 12
-
-#define CLK_TIME_W    (4 * CLK_DIGIT_W + CLK_COLON_W)
-#define CLK_TIME_X    ((LY_W - CLK_TIME_W) / 2)
-
 static int prevMinute = -1;
-static char prevDigits[5] = {0, 0, 0, 0, 0};
-static bool prevColon = false;
-static char prevDateBuf[28] = "";
-static char prevAmPm[3] = "";
+
+static void drawBambuMiniLogoClock(int16_t cx, int16_t cy, uint16_t color, uint16_t bg) {
+  const int16_t bw = 14;
+  const int16_t bh = 36;
+  const int16_t gap = 5;
+  const int16_t x0 = cx - bw - gap / 2;
+  const int16_t x1 = cx + gap / 2;
+  const int16_t y  = cy - bh / 2;
+
+  tft.fillRect(x0, y, bw, bh, color);
+  tft.fillRect(x1, y, bw, bh, color);
+
+  const int16_t sl = 5, th = 3;
+
+  auto slash_fwd = [&](int16_t x, int16_t lc) {
+    tft.fillTriangle(x,    lc-th,    x+bw, lc-sl-th, x,    lc,    bg);
+    tft.fillTriangle(x+bw, lc-sl-th, x,    lc,       x+bw, lc-sl, bg);
+  };
+
+  auto slash_rev = [&](int16_t x, int16_t lc) {
+    tft.fillTriangle(x,    lc-th,    x+bw, lc+sl-th, x,    lc,    bg);
+    tft.fillTriangle(x+bw, lc+sl-th, x,    lc,       x+bw, lc+sl, bg);
+  };
+
+  slash_fwd(x0, y + 22);   // left bar: '/' cut
+  slash_rev(x1, y + 14);   // right bar: '\\' cut higher than left slash
+}
 
 void resetClock() {
   prevMinute = -1;
-  memset(prevDigits, 0, sizeof(prevDigits));
-  prevColon = false;
-  prevDateBuf[0] = '\0';
-  prevAmPm[0] = '\0';
-}
-
-// X position for each of the 5 slots: d0 d1 : d3 d4
-static int clkDigitX(int i) {
-  if (i < 2) return CLK_TIME_X + i * CLK_DIGIT_W;
-  if (i == 2) return CLK_TIME_X + 2 * CLK_DIGIT_W;  // colon
-  return CLK_TIME_X + 2 * CLK_DIGIT_W + CLK_COLON_W + (i - 3) * CLK_DIGIT_W;
 }
 
 void drawClock() {
   struct tm now;
   if (!getLocalTime(&now, 0)) {
+    // getLocalTime() fails when SNTP sync status is reset (e.g., after a
+    // timezone change). Fall back to the raw system clock, which remains
+    // valid even without a completed NTP sync.
     time_t t = time(nullptr);
-    if (t < 1600000000UL) return;
+    if (t < 1600000000UL) return;  // sanity: before Sep 2020 = clock not set
     localtime_r(&t, &now);
   }
 
-  uint16_t bg = dispSettings.bgColor;
-  uint16_t timeClr = dispSettings.clockTimeColor;
-  uint16_t dateClr = dispSettings.clockDateColor;
-
-  // --- Colon blink (every call, ~250ms) ---
-  bool colonOn = (millis() % 1000) < 500;
-  if (colonOn != prevColon) {
-    int cx = clkDigitX(2);
-    int cy = LY_CLK_TIME_Y - CLK_DIGIT_H / 2;
-    tft.fillRect(cx, cy, CLK_COLON_W, CLK_DIGIT_H, bg);
-    if (colonOn) {
-      tft.setTextFont(7);
-      tft.setTextSize(1);
-      tft.setTextColor(timeClr, bg);
-      tft.drawChar(':', cx, cy, 7);
-    }
-    prevColon = colonOn;
-  }
-
-  // --- Only update digits/date when minute changes ---
+  // Only redraw when minute changes (resetClock() forces redraw)
   if (now.tm_min == prevMinute) return;
   prevMinute = now.tm_min;
 
-  // Build digit array
-  char digits[5];
+  uint16_t bg = dispSettings.bgColor;
+
+  // Clear clock area
+  tft.fillRect(0, LY_CLK_CLEAR_Y, LY_W, LY_CLK_CLEAR_H, bg);
+
+  // Time — large 7-segment font
+  char timeBuf[12];
   if (netSettings.use24h) {
-    digits[0] = '0' + (now.tm_hour / 10);
-    digits[1] = '0' + (now.tm_hour % 10);
+    snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d", now.tm_hour, now.tm_min);
   } else {
     int h = now.tm_hour % 12;
     if (h == 0) h = 12;
-    digits[0] = (h >= 10) ? '1' : ' ';
-    digits[1] = '0' + (h % 10);
+    snprintf(timeBuf, sizeof(timeBuf), "%2d:%02d", h, now.tm_min);
   }
-  digits[2] = ':';
-  digits[3] = '0' + (now.tm_min / 10);
-  digits[4] = '0' + (now.tm_min % 10);
-
-  // Draw only changed digits
+  tft.setTextDatum(MC_DATUM);
   tft.setTextFont(7);
-  tft.setTextSize(1);
-  tft.setTextColor(timeClr, bg);
+  tft.setTextColor(CLR_TEXT, bg);
+  tft.drawString(timeBuf, LY_W / 2, LY_CLK_TIME_Y);
 
-  int dy = LY_CLK_TIME_Y - CLK_DIGIT_H / 2;  // top-left Y (MC_DATUM centers at LY_CLK_TIME_Y)
-
-  for (int i = 0; i < 5; i++) {
-    if (i == 2) continue;  // colon handled above
-    if (digits[i] == prevDigits[i]) continue;
-
-    int x = clkDigitX(i);
-    int clearW = CLK_DIGIT_W + 2;
-    tft.fillRect(x, dy, clearW, CLK_DIGIT_H, bg);
-    tft.drawChar(digits[i], x, dy, 7);
-    prevDigits[i] = digits[i];
-  }
-
-  // Force colon redraw after full redraw (first draw or resetClock)
-  if (prevDigits[2] == 0) {
-    prevColon = !colonOn;  // will be redrawn on next call
-    prevDigits[2] = ':';
-  }
-
-  // --- AM/PM (12h mode) / clear stale AM/PM when switching to 24h ---
+  // AM/PM indicator for 12h mode
   if (!netSettings.use24h) {
-    const char* ampm = now.tm_hour < 12 ? "AM" : "PM";
-    if (strcmp(ampm, prevAmPm) != 0) {
-      tft.setTextDatum(MC_DATUM);
-      tft.setTextFont(4);
-      tft.setTextColor(dateClr, bg);
-      int ampmW = tft.textWidth("PM");
-      tft.fillRect(LY_W / 2 - ampmW / 2 - 2, LY_CLK_AMPM_Y - 12, ampmW + 4, 24, bg);
-      tft.drawString(ampm, LY_W / 2, LY_CLK_AMPM_Y);
-      strlcpy(prevAmPm, ampm, sizeof(prevAmPm));
-    }
-  } else if (prevAmPm[0] != '\0') {
-    tft.setTextDatum(MC_DATUM);
     tft.setTextFont(4);
-    int ampmW = tft.textWidth("PM");
-    tft.fillRect(LY_W / 2 - ampmW / 2 - 2, LY_CLK_AMPM_Y - 12, ampmW + 4, 24, bg);
-    prevAmPm[0] = '\0';
+    tft.setTextColor(CLR_TEXT_DIM, bg);
+    tft.drawString(now.tm_hour < 12 ? "AM" : "PM", LY_W / 2, LY_CLK_AMPM_Y);
   }
 
-  // --- Date ---
+  // Date — smaller font below
   const char* days[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
   const char* months[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
-  char dateBuf[28];
+  char dateBuf[24];
   int day = now.tm_mday, mon = now.tm_mon + 1, year = now.tm_year + 1900;
   switch (netSettings.dateFormat) {
     case 1:  snprintf(dateBuf, sizeof(dateBuf), "%s  %02d-%02d-%04d", days[now.tm_wday], day, mon, year); break;
@@ -137,17 +92,10 @@ void drawClock() {
     case 5:  snprintf(dateBuf, sizeof(dateBuf), "%s  %s %d, %04d", days[now.tm_wday], months[now.tm_mon], day, year); break;
     default: snprintf(dateBuf, sizeof(dateBuf), "%s  %02d.%02d.%04d", days[now.tm_wday], day, mon, year); break;
   }
+  tft.setTextFont(4);
+  tft.setTextColor(CLR_TEXT_DIM, bg);
+  tft.drawString(dateBuf, LY_W / 2, LY_CLK_DATE_Y);
 
-  if (strcmp(dateBuf, prevDateBuf) != 0) {
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextFont(4);
-    tft.setTextColor(dateClr, bg);
-    // Clear previous date, draw new
-    int dateW = tft.textWidth(prevDateBuf[0] ? prevDateBuf : dateBuf);
-    int newW = tft.textWidth(dateBuf);
-    int clearW = (dateW > newW) ? dateW : newW;
-    tft.fillRect(LY_W / 2 - clearW / 2 - 2, LY_CLK_DATE_Y - 12, clearW + 4, 24, bg);
-    tft.drawString(dateBuf, LY_W / 2, LY_CLK_DATE_Y);
-    strlcpy(prevDateBuf, dateBuf, sizeof(prevDateBuf));
-  }
+  // Small brand mark above time
+  drawBambuMiniLogoClock(LY_W / 2, LY_CLK_CLEAR_Y + 12, CLR_GREEN, bg);
 }

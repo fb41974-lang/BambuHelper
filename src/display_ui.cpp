@@ -10,9 +10,13 @@
 #include "bambu_mqtt.h"
 #include "settings.h"
 #include "tasmota.h"
+#ifdef USE_XPT2046
+#include "touch_buttons.h"
+#endif
 #include <WiFi.h>
 #include <time.h>
 
+// Global TFT_eSPI instance
 TFT_eSPI tft = TFT_eSPI();
 
 // Use user-configured bg color instead of hardcoded CLR_BG
@@ -28,18 +32,19 @@ static unsigned long lastDisplayUpdate = 0;
 static BambuState prevState;
 static bool prevWaitingForDoor = false;
 static unsigned long connectScreenStart = 0;
+#if defined(DISPLAY_CYD)
+static bool extraGaugesInited = false;   // forward decl for triggerDisplayTransition
+#endif
 
 // ---------------------------------------------------------------------------
 //  Smooth gauge interpolation - values lerp toward MQTT actuals each frame
 // ---------------------------------------------------------------------------
-static float smoothNozzleTemp   = 0;
-static float smoothBedTemp      = 0;
-static float smoothPartFan     = 0;
-static float smoothAuxFan      = 0;
-static float smoothChamberFan  = 0;
-static float smoothChamberTemp = 0;
-static float smoothHeatbreakFan= 0;
-static bool  smoothInited      = false;
+static float smoothNozzleTemp = 0;
+static float smoothBedTemp    = 0;
+static float smoothPartFan    = 0;
+static float smoothAuxFan     = 0;
+static float smoothChamberFan = 0;
+static bool  smoothInited     = false;
 
 static bool gaugesAnimating = false;       // true while arcs are interpolating
 static const unsigned long GAUGE_ANIM_MS = 80; // ~12 Hz during animation
@@ -56,38 +61,63 @@ static void smoothLerp(float& cur, float target) {
 // Returns true if any gauge is still animating
 static bool tickGaugeSmooth(const BambuState& s, bool snap) {
   if (snap || !smoothInited) {
-    smoothNozzleTemp   = s.nozzleTemp;
-    smoothBedTemp      = s.bedTemp;
-    smoothPartFan      = s.coolingFanPct;
-    smoothAuxFan       = s.auxFanPct;
-    smoothChamberFan   = s.chamberFanPct;
-    smoothChamberTemp  = s.chamberTemp;
-    smoothHeatbreakFan = s.heatbreakFanPct;
+    smoothNozzleTemp = s.nozzleTemp;
+    smoothBedTemp    = s.bedTemp;
+    smoothPartFan    = s.coolingFanPct;
+    smoothAuxFan     = s.auxFanPct;
+    smoothChamberFan = s.chamberFanPct;
     smoothInited = true;
     return false;
   }
-  smoothLerp(smoothNozzleTemp,   s.nozzleTemp);
-  smoothLerp(smoothBedTemp,      s.bedTemp);
-  smoothLerp(smoothPartFan,      (float)s.coolingFanPct);
-  smoothLerp(smoothAuxFan,       (float)s.auxFanPct);
-  smoothLerp(smoothChamberFan,   (float)s.chamberFanPct);
-  smoothLerp(smoothChamberTemp,  s.chamberTemp);
-  smoothLerp(smoothHeatbreakFan, (float)s.heatbreakFanPct);
+  smoothLerp(smoothNozzleTemp, s.nozzleTemp);
+  smoothLerp(smoothBedTemp,    s.bedTemp);
+  smoothLerp(smoothPartFan,    (float)s.coolingFanPct);
+  smoothLerp(smoothAuxFan,     (float)s.auxFanPct);
+  smoothLerp(smoothChamberFan, (float)s.chamberFanPct);
 
   const float ANIM_EPS = 0.01f;
-  return (fabsf(smoothNozzleTemp   - s.nozzleTemp)              > ANIM_EPS) ||
-         (fabsf(smoothBedTemp      - s.bedTemp)                 > ANIM_EPS) ||
-         (fabsf(smoothPartFan      - (float)s.coolingFanPct)    > ANIM_EPS) ||
-         (fabsf(smoothAuxFan       - (float)s.auxFanPct)        > ANIM_EPS) ||
-         (fabsf(smoothChamberFan   - (float)s.chamberFanPct)    > ANIM_EPS) ||
-         (fabsf(smoothChamberTemp  - s.chamberTemp)             > ANIM_EPS) ||
-         (fabsf(smoothHeatbreakFan - (float)s.heatbreakFanPct)  > ANIM_EPS);
+  return (fabsf(smoothNozzleTemp - s.nozzleTemp) > ANIM_EPS) ||
+         (fabsf(smoothBedTemp    - s.bedTemp)    > ANIM_EPS) ||
+         (fabsf(smoothPartFan    - (float)s.coolingFanPct) > ANIM_EPS) ||
+         (fabsf(smoothAuxFan     - (float)s.auxFanPct)     > ANIM_EPS) ||
+         (fabsf(smoothChamberFan - (float)s.chamberFanPct) > ANIM_EPS);
 }
 
 // ---------------------------------------------------------------------------
 //  Backlight
 // ---------------------------------------------------------------------------
 static uint8_t lastAppliedBrightness = 0;
+
+static void drawBambuMiniLogo(int16_t cx, int16_t cy, uint16_t color, uint16_t bg) {
+  const int16_t bw = 19;
+  const int16_t bh = 52;
+  const int16_t gap = 6;
+  const int16_t x0 = cx - bw - gap / 2;  // left bar x
+  const int16_t x1 = cx + gap / 2;       // right bar x
+  const int16_t y  = cy - bh / 2;
+
+  tft.fillRect(x0, y, bw, bh, color);
+  tft.fillRect(x1, y, bw, bh, color);
+
+  const int16_t sl = 7, th = 4;
+
+  // Left bar: '/' slash — rises left to right
+  // lc = bottom-left of cut
+  auto slash_fwd = [&](int16_t x, int16_t lc) {
+    tft.fillTriangle(x,    lc-th,    x+bw, lc-sl-th, x,    lc,    bg);
+    tft.fillTriangle(x+bw, lc-sl-th, x,    lc,       x+bw, lc-sl, bg);
+  };
+
+  // Right bar: '\' slash — descends left to right (opposite direction)
+  // lc = bottom-left of cut
+  auto slash_rev = [&](int16_t x, int16_t lc) {
+    tft.fillTriangle(x,    lc-th,    x+bw, lc+sl-th, x,    lc,    bg);
+    tft.fillTriangle(x+bw, lc+sl-th, x,    lc,       x+bw, lc+sl, bg);
+  };
+
+  slash_fwd(x0, y + 31);   // left bar: '/' cut
+  slash_rev(x1, y + 22);   // right bar: '\\' cut higher than left slash
+}
 
 void setBacklight(uint8_t level) {
 #if defined(BACKLIGHT_PIN) && BACKLIGHT_PIN >= 0
@@ -136,6 +166,7 @@ void initDisplay() {
 
   // Splash screen
   tft.setTextDatum(MC_DATUM);
+  drawBambuMiniLogo(SCREEN_W / 2, SCREEN_H / 2 - 60, CLR_GREEN, CLR_BG);
   tft.setTextColor(CLR_GREEN, CLR_BG);
   tft.setTextFont(4);
   tft.drawString("BambuHelper", SCREEN_W / 2, SCREEN_H / 2 - 20);
@@ -170,6 +201,9 @@ void triggerDisplayTransition() {
   // Clear previous state so everything redraws for the new printer
   memset(&prevState, 0, sizeof(prevState));
   smoothInited = false;  // snap gauges to new printer's values
+#if defined(DISPLAY_CYD)
+  extraGaugesInited = false;
+#endif
   resetGaugeTextCache();
   tft.fillScreen(dispSettings.bgColor);
   forceRedraw = true;
@@ -644,8 +678,10 @@ static bool cydLandscape() {
 
 static uint8_t  prevAmsUnitCount = 0;
 static uint8_t  prevAmsActive    = 255;
+static int8_t   prevAmsHumidity  = -2;
 static uint16_t prevAmsTrayColors[AMS_MAX_TRAYS] = {0};
 static bool     prevAmsTrayPresent[AMS_MAX_TRAYS] = {false};
+static uint8_t  prevCydExtraMode = 0;   // track mode switches for zone clearing
 
 // Helper: draw a single AMS tray bar (used by both portrait and landscape)
 static void drawAmsTrayBar(int16_t x, int16_t y, int16_t w, int16_t h,
@@ -671,7 +707,8 @@ static void drawAmsZone(const BambuState& s, bool force) {
   bool changed = force;
   if (!changed) {
     changed = (s.ams.unitCount != prevAmsUnitCount) ||
-              (s.ams.activeTray != prevAmsActive);
+              (s.ams.activeTray != prevAmsActive) ||
+              (s.ams.humidityPct != prevAmsHumidity);
     if (!changed) {
       for (uint8_t i = 0; i < s.ams.unitCount * AMS_TRAYS_PER_UNIT && !changed; i++) {
         changed = (s.ams.trays[i].present != prevAmsTrayPresent[i]) ||
@@ -684,6 +721,7 @@ static void drawAmsZone(const BambuState& s, bool force) {
   // Save state for next comparison
   prevAmsUnitCount = s.ams.unitCount;
   prevAmsActive    = s.ams.activeTray;
+  prevAmsHumidity  = s.ams.humidityPct;
   for (uint8_t i = 0; i < AMS_MAX_TRAYS; i++) {
     prevAmsTrayPresent[i] = s.ams.trays[i].present;
     prevAmsTrayColors[i]  = s.ams.trays[i].colorRgb565;
@@ -756,7 +794,8 @@ static void drawAmsZone(const BambuState& s, bool force) {
 
     if (units == 0 || units > AMS_MAX_UNITS) return;
 
-    const int16_t usableW = LY_W - 2 * LY_AMS_MARGIN;
+    const int16_t humW = 42;
+    const int16_t usableW = LY_W - 2 * LY_AMS_MARGIN - humW;
     int16_t groupW = (usableW - (units - 1) * LY_AMS_GROUP_GAP) / units;
     int16_t barW = (groupW - (AMS_TRAYS_PER_UNIT - 1) * LY_AMS_BAR_GAP) / AMS_TRAYS_PER_UNIT;
     if (barW > LY_AMS_BAR_MAX_W) barW = LY_AMS_BAR_MAX_W;
@@ -764,7 +803,10 @@ static void drawAmsZone(const BambuState& s, bool force) {
 
     int16_t actualGroupW = barW * AMS_TRAYS_PER_UNIT + (AMS_TRAYS_PER_UNIT - 1) * LY_AMS_BAR_GAP;
     int16_t totalW = actualGroupW * units + (units - 1) * LY_AMS_GROUP_GAP;
-    int16_t startX = (LY_W - totalW) / 2;
+    // Center the grid in the space left of the humidity widget
+    int16_t gridAreaW = LY_W - humW - LY_AMS_MARGIN;
+    int16_t startX = LY_AMS_MARGIN + (gridAreaW - totalW) / 2;
+    if (startX < LY_AMS_MARGIN) startX = LY_AMS_MARGIN;
 
     int16_t barY = LY_AMS_Y + (LY_AMS_H - LY_AMS_BAR_H - LY_AMS_LABEL_OFFY - 8) / 2;
     int16_t labelY = barY + LY_AMS_BAR_H + LY_AMS_LABEL_OFFY;
@@ -787,6 +829,82 @@ static void drawAmsZone(const BambuState& s, bool force) {
       tft.setTextColor(CLR_TEXT_DIM, CLR_BG);
       tft.drawString(label, groupX + actualGroupW / 2, labelY + 2);
     }
+
+    // Humidity widget to the right of AMS tray grid (droplet + percentage)
+    int16_t humIconX = LY_W - 56;
+    int16_t humY = LY_AMS_Y + 22;
+    uint16_t humColor = (s.ams.humidityPct >= 0) ? CLR_CYAN : CLR_TEXT_DARK;
+
+    // Droplet icon
+    tft.fillCircle(humIconX + 4, humY + 2, 3, humColor);
+    tft.fillTriangle(humIconX + 4, humY - 5, humIconX + 1, humY + 1, humIconX + 7, humY + 1, humColor);
+
+    tft.setTextDatum(ML_DATUM);
+    tft.setTextFont(2);
+    tft.setTextColor(humColor, CLR_BG);
+    if (s.ams.humidityPct >= 0) {
+      char humBuf[8];
+      snprintf(humBuf, sizeof(humBuf), "%d%%", s.ams.humidityPct);
+      tft.drawString(humBuf, humIconX + 11, humY + 1);
+    } else {
+      tft.drawString("--%", humIconX + 11, humY + 1);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  Extra Gauges: 2 mini-gauges (Chamber Temp + Heatbreak Fan) for CYD extra area
+// ---------------------------------------------------------------------------
+static float smoothExtraChamber = 0;
+static float smoothExtraHeatbreak = 0;
+
+static void drawExtraGauges(const BambuState& s, bool landscape, bool force) {
+  // Initialize smooth values on first call
+  if (!extraGaugesInited || force) {
+    smoothExtraChamber = s.chamberTemp;
+    smoothExtraHeatbreak = (float)s.heatbreakFanPct;
+    extraGaugesInited = true;
+  } else {
+    smoothLerp(smoothExtraChamber, s.chamberTemp);
+    smoothLerp(smoothExtraHeatbreak, (float)s.heatbreakFanPct);
+  }
+
+  // Change detection
+  bool extraAnim = (fabsf(smoothExtraChamber - s.chamberTemp) > 0.01f) ||
+                   (fabsf(smoothExtraHeatbreak - (float)s.heatbreakFanPct) > 0.01f);
+  gaugesAnimating = gaugesAnimating || extraAnim;
+  bool changed = force || extraAnim ||
+    (s.chamberTemp != prevState.chamberTemp) ||
+    (s.heatbreakFanPct != prevState.heatbreakFanPct);
+  if (!changed) return;
+
+  if (landscape) {
+    // Landscape: right sidebar, two gauges stacked vertically
+    if (force) {
+      tft.fillRect(LY_LAND_AMS_X - 4, LY_LAND_AMS_TOP,
+                   LY_LAND_AMS_W + 8, LY_LAND_AMS_BOT - LY_LAND_AMS_TOP, CLR_BG);
+    }
+    drawTempGauge(tft, LY_EXTRA_LAND_GX, LY_EXTRA_LAND_G1Y, LY_EXTRA_LAND_GR,
+                  s.chamberTemp, 0.0f, 60.0f,
+                  CLR_CYAN, "Chamber", nullptr, force,
+                  &dispSettings.chamberFan, smoothExtraChamber);
+
+    drawFanGauge(tft, LY_EXTRA_LAND_GX, LY_EXTRA_LAND_G2Y, LY_EXTRA_LAND_GR,
+                 s.heatbreakFanPct, CLR_ORANGE, "HBreak", force,
+                 &dispSettings.auxFan, smoothExtraHeatbreak);
+  } else {
+    // Portrait: horizontal zone between gauge row 2 and ETA
+    if (force) {
+      tft.fillRect(0, LY_EXTRA_PORT_Y, LY_W, LY_EXTRA_PORT_H, CLR_BG);
+    }
+    drawTempGauge(tft, LY_EXTRA_PORT_G1X, LY_EXTRA_PORT_GY, LY_EXTRA_PORT_GR,
+                  s.chamberTemp, 0.0f, 60.0f,
+                  CLR_CYAN, "Chamber", nullptr, force,
+                  &dispSettings.chamberFan, smoothExtraChamber);
+
+    drawFanGauge(tft, LY_EXTRA_PORT_G2X, LY_EXTRA_PORT_GY, LY_EXTRA_PORT_GR,
+                 s.heatbreakFanPct, CLR_ORANGE, "HBreak", force,
+                 &dispSettings.auxFan, smoothExtraHeatbreak);
   }
 }
 
@@ -815,14 +933,28 @@ static void drawPrinting() {
   bool animating = tickGaugeSmooth(s, forceRedraw);
   gaugesAnimating = animating;
   bool progChanged = forceRedraw || (s.progress != prevState.progress);
+  bool tempChanged = forceRedraw || animating ||
+                     (s.nozzleTemp != prevState.nozzleTemp) ||
+                     (s.nozzleTarget != prevState.nozzleTarget) ||
+                     (s.bedTemp != prevState.bedTemp) ||
+                     (s.bedTarget != prevState.bedTarget);
   bool etaChanged = forceRedraw ||
                      (s.remainingMinutes != prevState.remainingMinutes);
+  bool fansChanged = forceRedraw || animating ||
+                     (s.coolingFanPct != prevState.coolingFanPct) ||
+                     (s.auxFanPct != prevState.auxFanPct) ||
+                     (s.chamberFanPct != prevState.chamberFanPct);
   bool stateChanged = forceRedraw ||
                       (strcmp(s.gcodeState, prevState.gcodeState) != 0);
 
   // 2x3 gauge grid constants (from layout profile)
   const int16_t gR = LY_GAUGE_R;
   const int16_t gT = LY_GAUGE_T;
+  const int16_t col1 = LY_COL1;
+  const int16_t col2 = LY_COL2;
+  const int16_t col3 = LY_COL3;
+  const int16_t row1Y = LY_ROW1;
+  const int16_t row2Y = LY_ROW2;
 
   // Effective Y positions — landscape on CYD uses 240x240-style positions
 #if defined(DISPLAY_CYD)
@@ -897,104 +1029,72 @@ static void drawPrinting() {
     }
   }
 
-  // === Configurable 2x3 gauge grid ===
-  {
-    static const int16_t slotX[GAUGE_SLOT_COUNT] = { LY_COL1, LY_COL2, LY_COL3, LY_COL1, LY_COL2, LY_COL3 };
-    static const int16_t slotY[GAUGE_SLOT_COUNT] = { LY_ROW1, LY_ROW1, LY_ROW1, LY_ROW2, LY_ROW2, LY_ROW2 };
-    static uint8_t prevSlotTypes[GAUGE_SLOT_COUNT] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+  // === Row 1: Progress | Nozzle | Bed ===
 
-    for (uint8_t si = 0; si < GAUGE_SLOT_COUNT; si++) {
-      uint8_t gt = p.config.gaugeSlots[si];
-      if (gt >= GAUGE_TYPE_COUNT) gt = GAUGE_EMPTY;
-
-      bool typeChanged = (gt != prevSlotTypes[si]);
-      if (typeChanged) {
-        // Slot type changed (or first draw) - clear area and reset cache
-        tft.fillCircle(slotX[si], slotY[si], gR + 2, dispSettings.bgColor);
-        // Clear label area below gauge
-        bool sm = dispSettings.smallLabels;
-        tft.fillRect(slotX[si] - gR, slotY[si] + gR + (sm ? 1 : -3),
-                     gR * 2, sm ? 12 : 16, dispSettings.bgColor);
-        prevSlotTypes[si] = gt;
-      }
-
-      // Per-type change detection
-      bool needDraw = forceRedraw || typeChanged;
-      if (!needDraw) {
-        switch (gt) {
-          case GAUGE_PROGRESS:    needDraw = (s.progress != prevState.progress) || (s.remainingMinutes != prevState.remainingMinutes); break;
-          case GAUGE_NOZZLE:      needDraw = animating || s.nozzleTemp != prevState.nozzleTemp || s.nozzleTarget != prevState.nozzleTarget; break;
-          case GAUGE_BED:         needDraw = animating || s.bedTemp != prevState.bedTemp || s.bedTarget != prevState.bedTarget; break;
-          case GAUGE_PART_FAN:    needDraw = animating || s.coolingFanPct != prevState.coolingFanPct; break;
-          case GAUGE_AUX_FAN:     needDraw = animating || s.auxFanPct != prevState.auxFanPct; break;
-          case GAUGE_CHAMBER_FAN: needDraw = animating || s.chamberFanPct != prevState.chamberFanPct; break;
-          case GAUGE_CHAMBER_TEMP:needDraw = animating || s.chamberTemp != prevState.chamberTemp; break;
-          case GAUGE_HEATBREAK:   needDraw = animating || s.heatbreakFanPct != prevState.heatbreakFanPct; break;
-          case GAUGE_CLOCK:       needDraw = true; break;  // text cache handles actual redraw
-          default: break;
-        }
-      }
-      if (!needDraw) continue;
-
-      int16_t cx = slotX[si], cy = slotY[si];
-      bool fr = forceRedraw || typeChanged;
-
-      switch (gt) {
-        case GAUGE_PROGRESS:
-          drawProgressArc(tft, cx, cy, gR, gT, s.progress, prevState.progress, s.remainingMinutes, fr);
-          break;
-        case GAUGE_NOZZLE:
-          drawTempGauge(tft, cx, cy, gR, s.nozzleTemp, s.nozzleTarget, 300.0f,
-                        dispSettings.nozzle.arc, nozzleLabel(s), nullptr, fr,
-                        &dispSettings.nozzle, smoothNozzleTemp);
-          break;
-        case GAUGE_BED:
-          drawTempGauge(tft, cx, cy, gR, s.bedTemp, s.bedTarget, 120.0f,
-                        dispSettings.bed.arc, "Bed", nullptr, fr,
-                        &dispSettings.bed, smoothBedTemp);
-          break;
-        case GAUGE_PART_FAN:
-          drawFanGauge(tft, cx, cy, gR, s.coolingFanPct, dispSettings.partFan.arc, "Part", fr,
-                       &dispSettings.partFan, smoothPartFan);
-          break;
-        case GAUGE_AUX_FAN:
-          drawFanGauge(tft, cx, cy, gR, s.auxFanPct, dispSettings.auxFan.arc, "Aux", fr,
-                       &dispSettings.auxFan, smoothAuxFan);
-          break;
-        case GAUGE_CHAMBER_FAN:
-          drawFanGauge(tft, cx, cy, gR, s.chamberFanPct, dispSettings.chamberFan.arc, "Chamber", fr,
-                       &dispSettings.chamberFan, smoothChamberFan);
-          break;
-        case GAUGE_CHAMBER_TEMP:
-          drawTempGauge(tft, cx, cy, gR, s.chamberTemp, 0.0f, 60.0f,
-                        dispSettings.chamberTemp.arc, "Chamber", nullptr, fr,
-                        &dispSettings.chamberTemp, smoothChamberTemp);
-          break;
-        case GAUGE_HEATBREAK:
-          drawFanGauge(tft, cx, cy, gR, s.heatbreakFanPct, dispSettings.heatbreak.arc, "HBreak", fr,
-                       &dispSettings.heatbreak, smoothHeatbreakFan);
-          break;
-        case GAUGE_CLOCK:
-          drawClockWidget(tft, cx, cy, gR, gT, fr);
-          break;
-        case GAUGE_EMPTY:
-        default:
-          if (fr) tft.fillCircle(cx, cy, gR + 2, dispSettings.bgColor);
-          break;
-      }
-    }
+  if (progChanged || forceRedraw) {
+    drawProgressArc(tft, col1, row1Y, gR, gT,
+                    s.progress, prevState.progress,
+                    s.remainingMinutes, forceRedraw);
   }
 
-  // === AMS zone (CYD: portrait + landscape) ===
+  if (tempChanged) {
+    drawTempGauge(tft, col2, row1Y, gR,
+                  s.nozzleTemp, s.nozzleTarget, 300.0f,
+                  dispSettings.nozzle.arc, nozzleLabel(s), nullptr, forceRedraw,
+                  &dispSettings.nozzle, smoothNozzleTemp);
+
+    drawTempGauge(tft, col3, row1Y, gR,
+                  s.bedTemp, s.bedTarget, 120.0f,
+                  dispSettings.bed.arc, "Bed", nullptr, forceRedraw,
+                  &dispSettings.bed, smoothBedTemp);
+  }
+
+  // === Row 2: Part Fan | Aux Fan | Chamber Fan (y=106-176) ===
+
+  if (fansChanged) {
+    drawFanGauge(tft, col1, row2Y, gR,
+                 s.coolingFanPct, dispSettings.partFan.arc, "Part", forceRedraw,
+                 &dispSettings.partFan, smoothPartFan);
+
+    drawFanGauge(tft, col2, row2Y, gR,
+                 s.auxFanPct, dispSettings.auxFan.arc, "Aux", forceRedraw,
+                 &dispSettings.auxFan, smoothAuxFan);
+
+    drawFanGauge(tft, col3, row2Y, gR,
+                 s.chamberFanPct, dispSettings.chamberFan.arc, "Chamber", forceRedraw,
+                 &dispSettings.chamberFan, smoothChamberFan);
+  }
+
+  // === AMS / Extra Gauges zone (CYD: portrait + landscape) ===
 #if defined(DISPLAY_CYD)
-  if (s.ams.present && s.ams.unitCount > 0) {
-    drawAmsZone(s, forceRedraw);
+  {
+    // Detect mode switch - clear the zone so old content doesn't persist
+    bool modeChanged = (dispSettings.cydExtraMode != prevCydExtraMode);
+    if (modeChanged) {
+      prevCydExtraMode = dispSettings.cydExtraMode;
+      if (land) {
+        tft.fillRect(LY_LAND_AMS_X - 4, LY_LAND_AMS_TOP, LY_LAND_AMS_W + 8,
+                     LY_LAND_AMS_BOT - LY_LAND_AMS_TOP, CLR_BG);
+      } else {
+        tft.fillRect(0, LY_AMS_Y, LY_W, LY_AMS_H, CLR_BG);
+      }
+    }
+    bool zoneForce = forceRedraw || modeChanged;
+
+    if (dispSettings.cydExtraMode == 0 && s.ams.present && s.ams.unitCount > 0) {
+      drawAmsZone(s, zoneForce);
+    } else if (dispSettings.cydExtraMode == 1) {
+      drawExtraGauges(s, land, zoneForce);
+    }
   }
 #endif
 
   // === Info line — ETA finish time or PAUSE/ERROR alert ===
   if (etaChanged || stateChanged) {
     tft.fillRect(0, eff_etaY, SCREEN_W, eff_etaH, CLR_BG);
+#ifdef USE_XPT2046
+    touchButtonsDirty = true;  // ETA row cleared — force button redraw
+#endif
     tft.setTextDatum(MC_DATUM);
 
     if (strcmp(s.gcodeState, "PAUSE") == 0) {
@@ -1163,9 +1263,6 @@ static void drawPrinting() {
 static void drawFinished() {
   PrinterSlot& p = displayedPrinter();
   BambuState& s = p.state;
-  static bool  prevFinTasmotaOnline = false;
-  static float prevFinWatts = -2.0f;
-  static float prevFinKwh = -2.0f;
 
   // Effective screen dimensions — finished uses full screen (no AMS sidebar)
 #if defined(DISPLAY_CYD)
@@ -1264,33 +1361,29 @@ static void drawFinished() {
 
   // === kWh used during print (between filename and bottom bar) ===
   bool tasmotaActiveHere = tasmotaIsActiveForSlot(rotState.displayIndex);
-  float finishKwh = tasmotaActiveHere ? tasmotaGetPrintKwhUsed() : -1.0f;
-  bool kwhChanged = (tasmotaActiveHere && tasmotaKwhChanged()) ||
-                    (tasmotaActiveHere != prevFinTasmotaOnline) ||
-                    (finishKwh != prevFinKwh);
+  bool kwhChanged = tasmotaActiveHere && tasmotaKwhChanged();
   if (forceRedraw || kwhChanged) {
     int16_t kwhY = (LY_FIN_FILE_Y + eff_finBotY) / 2;
     tft.fillRect(0, kwhY - 9, scrW, 18, CLR_BG);
-    if (tasmotaActiveHere && finishKwh >= 0.0f) {
-      drawIcon16(tft, cx - 32, kwhY - 8, icon_lightning, CLR_YELLOW);
-      char kwhBuf[16];
-      snprintf(kwhBuf, sizeof(kwhBuf), "%.3f kWh", finishKwh);
-      tft.setTextDatum(ML_DATUM);
-      tft.setTextFont(2);
-      tft.setTextColor(CLR_TEXT_DIM, CLR_BG);
-      tft.drawString(kwhBuf, cx - 14, kwhY);
+    if (tasmotaActiveHere) {
+      float kwh = tasmotaGetPrintKwhUsed();
+      if (kwh >= 0.0f) {
+        drawIcon16(tft, cx - 32, kwhY - 8, icon_lightning, CLR_YELLOW);
+        char kwhBuf[16];
+        snprintf(kwhBuf, sizeof(kwhBuf), "%.3f kWh", kwh);
+        tft.setTextDatum(ML_DATUM);
+        tft.setTextFont(2);
+        tft.setTextColor(CLR_TEXT_DIM, CLR_BG);
+        tft.drawString(kwhBuf, cx - 14, kwhY);
+      }
     }
   }
-  prevFinKwh = finishKwh;
 
   // === Bottom status bar ===
   bool waitingForDoor = dpSettings.doorAckEnabled && s.doorSensorPresent && !s.doorAcknowledged;
-  float finCurWatts = tasmotaGetWatts();
   bool finBottomChanged = forceRedraw ||
                           (waitingForDoor != prevWaitingForDoor) ||
-                          (s.doorSensorPresent && s.doorOpen != prevState.doorOpen) ||
-                          (tasmotaActiveHere != prevFinTasmotaOnline) ||
-                          (finCurWatts != prevFinWatts);
+                          (s.doorSensorPresent && s.doorOpen != prevState.doorOpen);
   if (finBottomChanged) {
     prevWaitingForDoor = waitingForDoor;
     tft.fillRect(0, eff_finBotY, scrW, eff_finBotH, CLR_BG);
@@ -1306,15 +1399,6 @@ static void drawFinished() {
       char wifiBuf[12];
       snprintf(wifiBuf, sizeof(wifiBuf), "%ddBm", s.wifiSignal);
       tft.drawString(wifiBuf, 22, eff_finWifiY);
-
-      if (tasmotaActiveHere) {
-        drawIcon16(tft, cx - 20, eff_finWifiY - 8, icon_lightning, CLR_YELLOW);
-        char wBuf[8];
-        snprintf(wBuf, sizeof(wBuf), "%.0fW", finCurWatts);
-        tft.setTextDatum(ML_DATUM);
-        tft.setTextColor(CLR_TEXT_DIM, CLR_BG);
-        tft.drawString(wBuf, cx - 2, eff_finWifiY);
-      }
     }
     // Door status (right) — always show when sensor present
     if (s.doorSensorPresent) {
@@ -1327,8 +1411,6 @@ static void drawFinished() {
                  s.doorOpen ? icon_unlock : icon_lock, clr);
     }
   }
-  prevFinTasmotaOnline = tasmotaActiveHere;
-  prevFinWatts = finCurWatts;
 }
 
 // ---------------------------------------------------------------------------
@@ -1420,6 +1502,11 @@ void updateDisplay() {
       else resetClock();
       setBacklight(getEffectiveBrightness());  // dim for screensaver
     }
+#ifdef USE_XPT2046
+    if (currentScreen == SCREEN_PRINTING) {
+      touchButtonsDirty = true;  // Force redraw of buttons on entering print screen
+    }
+#endif
     prevScreen = currentScreen;
   }
 
@@ -1456,6 +1543,9 @@ void updateDisplay() {
 
     case SCREEN_PRINTING:
       drawPrinting();
+#ifdef USE_XPT2046
+      drawTouchButtons();
+#endif
       break;
 
     case SCREEN_FINISHED:
