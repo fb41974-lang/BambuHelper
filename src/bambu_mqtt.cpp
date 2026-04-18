@@ -152,20 +152,49 @@ static void requestPushall(MqttConn& c) {
   c.lastPushallRequest = millis();
 }
 
-static void clearLiveMetrics(BambuState& s) {
-  s.nozzleTemp = 0;    s.nozzleTarget = 0;
-  s.bedTemp = 0;       s.bedTarget = 0;
-  s.chamberTemp = 0;
-  s.progress = 0;
-  s.remainingMinutes = 0;
-  s.layerNum = 0;      s.totalLayers = 0;
-  s.coolingFanPct = 0; s.auxFanPct = 0;
-  s.chamberFanPct = 0; s.heatbreakFanPct = 0;
-  s.speedLevel = 0;
-  s.wifiSignal = 0;
-  s.doorOpen = false;  s.doorSensorPresent = false;
-  s.subtaskName[0] = '\0';
+// ---------------------------------------------------------------------------
+//  Send printer control commands
+// ---------------------------------------------------------------------------
+static void sendPrinterCommand(uint8_t slot, const char* command) {
+  if (slot >= MAX_ACTIVE_PRINTERS) {
+    Serial.printf("[MQTT CMD] invalid slot=%u\n", slot);
+    return;
+  }
+  if (!printers[slot].config.serial[0]) {
+    Serial.printf("[MQTT CMD] slot %u has no serial\n", slot);
+    return;
+  }
+  
+  MqttConn* conn = nullptr;
+  for (uint8_t i = 0; i < MAX_ACTIVE_PRINTERS; i++) {
+    if (conns[i].active && conns[i].slotIndex == slot) {
+      conn = &conns[i];
+      break;
+    }
+  }
+  
+  if (!conn || !conn->mqtt) {
+    Serial.printf("[MQTT CMD] slot %u not connected\n", slot);
+    return;
+  }
+
+  PrinterConfig& cfg = printers[slot].config;
+  char topic[64];
+  snprintf(topic, sizeof(topic), "device/%s/request", cfg.serial);
+
+  char payload[128];
+  snprintf(payload, sizeof(payload),
+           "{\"print\":{\"sequence_id\":\"%u\",\"command\":\"%s\",\"param\":\"\"}}",
+           conn->pushallSeqId++, command);
+
+  Serial.printf("[MQTT CMD] publish %s -> %s\n", command, topic);
+  bool ok = conn->mqtt->publish(topic, payload);
+  Serial.printf("[MQTT CMD] publish result=%d payload=%s\n", ok ? 1 : 0, payload);
 }
+
+void sendPrinterPause(uint8_t slot)  { sendPrinterCommand(slot, "pause"); }
+void sendPrinterResume(uint8_t slot) { sendPrinterCommand(slot, "resume"); }
+void sendPrinterStop(uint8_t slot)   { sendPrinterCommand(slot, "stop"); }
 
 // ---------------------------------------------------------------------------
 //  Find which MqttConn owns a given serial (for callback routing)
@@ -189,6 +218,49 @@ static void parseMqttPayload(byte* payload, unsigned int length,
                              BambuState& s, MqttDiag& diag, unsigned long& idleSince) {
   const char* payloadEnd = (const char*)payload + length;
 
+  auto parseHumidityPct = [](JsonVariant v) -> int8_t {
+    if (v.is<int>()) {
+      int val = v.as<int>();
+      // Some Bambu payloads expose AMS humidity as a level (1-5), not %.
+      // Map to a user-friendly approximate percentage.
+      if (val >= 1 && val <= 5) return (int8_t)(val * 10 + 7);
+      if (val >= 0 && val <= 100) return (int8_t)val;
+      return -1;
+    }
+    if (v.is<const char*>()) {
+      const char* hs = v.as<const char*>();
+      if (!hs) return -1;
+
+      // Compact level encoding "x/y" where x is level (e.g. "3/7" -> 37%)
+      const char* slash = strchr(hs, '/');
+      if (slash && slash > hs && *(slash + 1) >= '0' && *(slash + 1) <= '9') {
+        int d0 = *(slash - 1) - '0';
+        int d1 = *(slash + 1) - '0';
+        int val = d0 * 10 + d1;
+        if (val >= 0 && val <= 100) return (int8_t)val;
+      }
+
+      // Common cases: "37", "37%", "3/7"
+      int d0 = -1, d1 = -1;
+      for (const char* p = hs; *p; ++p) {
+        if (*p >= '0' && *p <= '9') {
+          if (d0 < 0) d0 = *p - '0';
+          else { d1 = *p - '0'; break; }
+        }
+      }
+      if (d0 < 0) return -1;
+      if (d1 >= 0) {
+        int val = d0 * 10 + d1;
+        if (val >= 0 && val <= 100) return (int8_t)val;
+      }
+
+      int val = atoi(hs);
+      if (val >= 1 && val <= 5) return (int8_t)(val * 10 + 7);
+      if (val >= 0 && val <= 100) return (int8_t)val;
+    }
+    return -1;
+  };
+
   // Filter document to reduce parse memory
   JsonDocument filter;
   JsonObject pf = filter["print"].to<JsonObject>();
@@ -210,6 +282,11 @@ static void parseMqttPayload(byte* payload, unsigned int length,
   pf["wifi_signal"] = true;
   pf["spd_lvl"] = true;
   pf["stat"] = true;  // H2 door sensor (hex string, bit 0x00800000 = door open)
+  pf["command"] = true;
+  pf["err_code"] = true;
+  pf["result"] = true;
+  pf["reason"] = true;
+  pf["sequence_id"] = true;
   // Note: H2D/H2C extruder data is parsed separately from raw payload (see below)
 
   JsonDocument doc;
@@ -303,6 +380,29 @@ static void parseMqttPayload(byte* payload, unsigned int length,
         if (!deserializeJson(amsDoc, amsObj, (size_t)(end - amsObj))) {
           s.ams.present = true;
           s.ams.unitCount = 0;
+          s.ams.humidityPct = -1;
+
+          // Prefer humidity_raw (percent as string or int) from first AMS unit
+          s.ams.humidityPct = -1;
+          JsonArray units = amsDoc["ams"];
+          for (JsonObject unit : units) {
+            if (!unit["id"].is<const char*>()) continue;
+            int8_t unitHum = -1;
+            if (!unit["humidity_raw"].isNull()) {
+              unitHum = parseHumidityPct(unit["humidity_raw"]);
+            }
+            if (unitHum < 0 && !unit["humidity"].isNull()) {
+              unitHum = parseHumidityPct(unit["humidity"]);
+            }
+            if (unitHum >= 0) {
+              s.ams.humidityPct = unitHum;
+              break;
+            }
+          }
+          // Fallback to top-level humidity if no AMS unit value found
+          if (s.ams.humidityPct < 0) {
+            s.ams.humidityPct = parseHumidityPct(amsDoc["humidity"]);
+          }
 
           // tray_now: flat tray index from the printer. For dual nozzle (H2D/H2C)
           // this only reflects one nozzle, so skip it - the per-nozzle snow field
@@ -316,6 +416,12 @@ static void parseMqttPayload(byte* payload, unsigned int length,
             uint8_t uid = atoi(unit["id"].as<const char*>());
             if (uid >= AMS_MAX_UNITS) continue;
             s.ams.unitCount++;
+
+            // Some firmware versions report humidity per AMS unit.
+            // Use the first available unit humidity as the global AMS humidity.
+            if (s.ams.humidityPct < 0) {
+              s.ams.humidityPct = parseHumidityPct(unit["humidity"]);
+            }
 
             JsonArray trays = unit["tray"];
             for (JsonObject tray : trays) {
@@ -346,6 +452,21 @@ static void parseMqttPayload(byte* payload, unsigned int length,
                 t.type[0] = '\0';
               }
             }
+          }
+
+          // Temporary diagnostic to confirm exact incoming humidity encoding.
+          static unsigned long lastHumDbg = 0;
+          if (millis() - lastHumDbg > 5000) {
+            char humRaw[20] = {0};
+            if (amsDoc["humidity"].is<int>()) {
+              snprintf(humRaw, sizeof(humRaw), "%d", amsDoc["humidity"].as<int>());
+            } else if (amsDoc["humidity"].is<const char*>()) {
+              strlcpy(humRaw, amsDoc["humidity"].as<const char*>(), sizeof(humRaw));
+            } else {
+              strlcpy(humRaw, "(none)", sizeof(humRaw));
+            }
+            Serial.printf("[AMS] humidity raw=%s parsed=%d\n", humRaw, s.ams.humidityPct);
+            lastHumDbg = millis();
           }
           MQTT_LOG("AMS: %d units, active tray=%d", s.ams.unitCount, s.ams.activeTray);
         }
@@ -383,6 +504,26 @@ static void parseMqttPayload(byte* payload, unsigned int length,
   if (print.isNull()) {
     s.lastUpdate = millis();  // any message keeps the stale timer alive
     return;
+  }
+
+  // Log printer response for control commands (pause/resume/stop)
+  if (print["command"].is<const char*>()) {
+    const char* cmd = print["command"].as<const char*>();
+    if (strcmp(cmd, "pause") == 0 || strcmp(cmd, "resume") == 0 || strcmp(cmd, "stop") == 0) {
+      const char* result = print["result"] | "(no result)";
+      const char* reason = print["reason"] | "";
+      int errCode = print["err_code"] | 0;
+      bool success = (strncasecmp(result, "success", 7) == 0);
+      if (success) {
+        Serial.printf("[MQTT CMD] %s accepted\n", cmd);
+      } else {
+        Serial.printf("[MQTT CMD] %s rejected, result=%s reason=%s err_code=%d (0x%08X)\n",
+                      cmd, result, reason, errCode, (unsigned)errCode);
+        if (errCode == (int)0x05024007) {
+          Serial.println("[MQTT CMD] Hint: enable LAN Mode on printer touchscreen (Settings -> Network -> LAN Mode)");
+        }
+      }
+    }
   }
 
   if (mqttDebugLog && print["gcode_state"].is<const char*>()) {
@@ -769,37 +910,25 @@ static void handleConn(MqttConn& c) {
         strlcpy(s.gcodeState, "IDLE", sizeof(s.gcodeState));
         c.stalePushallSentMs = 0;
       }
-    } else if (strcmp(s.gcodeState, "FINISH") == 0) {
-      // Keep FINISH visible for at least the configured timeout, but do not let
-      // a silent printer leave the dashboard stuck on frozen completion data.
-      unsigned long finishHoldMs = staleMs;
-      if (dpSettings.finishDisplayMins > 0) {
-        unsigned long configuredHoldMs = (unsigned long)dpSettings.finishDisplayMins * 60000UL;
-        if (configuredHoldMs > finishHoldMs) finishHoldMs = configuredHoldMs;
-      }
-
-      if (millis() - s.lastUpdate > finishHoldMs) {
-        if (isConnected && c.stalePushallSentMs == 0) {
-          MQTT_LOG("[%d] stale finish - sending recovery pushall", c.slotIndex);
-          esp_task_wdt_reset();
-          requestPushall(c);
-          c.stalePushallSentMs = millis();
-        } else if (c.stalePushallSentMs == 0 ||
-                   millis() - c.stalePushallSentMs > 30000) {
-          MQTT_LOG("[%d] stale finish - clearing cached state", c.slotIndex);
-          clearLiveMetrics(s);
-          strlcpy(s.gcodeState, "UNKNOWN", sizeof(s.gcodeState));
-          c.stalePushallSentMs = 0;
-        }
-      }
     } else if (isConnected && isCloudMode(cfg.mode) &&
                strcmp(s.gcodeState, "IDLE") == 0) {
       // Cloud broker connected but idle printer is unresponsive (powered off).
-      // IDLE can be cleared immediately; FINISH has its own grace window above
-      // and FAILED is intentionally left untouched.
+      // Only clear IDLE state - leave FINISH/FAILED alone so the user can
+      // still see the print result after powering down the printer.
       MQTT_LOG("[%d] stale idle on cloud - clearing cached state", c.slotIndex);
-      clearLiveMetrics(s);
+      s.nozzleTemp = 0;    s.nozzleTarget = 0;
+      s.bedTemp = 0;       s.bedTarget = 0;
+      s.chamberTemp = 0;
+      s.progress = 0;
+      s.remainingMinutes = 0;
+      s.layerNum = 0;      s.totalLayers = 0;
+      s.coolingFanPct = 0; s.auxFanPct = 0;
+      s.chamberFanPct = 0; s.heatbreakFanPct = 0;
+      s.speedLevel = 0;
+      s.wifiSignal = 0;
+      s.doorOpen = false;  s.doorSensorPresent = false;
       strlcpy(s.gcodeState, "UNKNOWN", sizeof(s.gcodeState));
+      s.subtaskName[0] = '\0';
       // Single recovery pushall - if printer just came back online this
       // gets fresh data immediately.  No periodic retries to avoid
       // access_denied (TLS alert 49) on the cloud broker.
